@@ -1,0 +1,54 @@
+# ESP-IDF generated build output
+build/
+**/build/
+
+# CMake generated files
+CMakeFiles/
+CMakeCache.txt
+cmake_install.cmake
+install_manifest.txt
+Makefile
+
+# Ninja files
+build.ninja
+.ninja_log
+.ninja_deps
+
+# IDF and project config caches
+sdkconfig.old
+sdkconfig.cmake
+sdkconfig.json
+project_description.json
+config.env
+
+# Temporary and editor files
+*.log
+*.tmp
+*.temp
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# VS Code settings
+.vscode/
+
+# Python and pip envs
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+ENV/
+
+# Misc
+*.bak
+*.orig
+*.rej
+
+# Partition table build artifacts
+partition_table/*.bin
+partition_table/*.elf
+partition_table/*.map
