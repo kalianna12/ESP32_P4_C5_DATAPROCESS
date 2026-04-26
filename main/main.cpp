@@ -15,13 +15,22 @@
 #include "linenoise/linenoise.h"
 #include "lwip/inet.h"
 #include "nvs_flash.h"
+#include "nvs.h"
+#include <algorithm>
 
 namespace {
 
-constexpr int kMaxScanResults = 20;
+constexpr int kMaxScanResults = 32;
 constexpr int kConsoleHistoryLength = 16;
 constexpr int kConsoleMaxLineLength = 128;
 constexpr uart_port_t kConsoleUart = static_cast<uart_port_t>(CONFIG_ESP_CONSOLE_UART_NUM);
+constexpr int kMaxSavedWifi = 10;
+constexpr const char *kNvsNamespace = "wifi_config";
+
+struct SavedWifiConfig {
+    char ssid[33];
+    char password[65];
+};
 
 static const char *TAG = "data_process";
 
@@ -39,18 +48,28 @@ struct WifiConsoleContext {
     bool wifi_started = false;
     bool has_scan_results = false;
     char selected_ssid[33] = {0};
+    SavedWifiConfig saved_wifi[kMaxSavedWifi];
+    uint16_t saved_wifi_count = 0;
 };
 
 static WifiConsoleContext g_ctx;
 static EventGroupHandle_t g_wifi_event_group = nullptr;
 static bool g_wifi_stack_ready = false;
+static char g_connecting_ssid[33] = {0};
+static char g_connecting_password[65] = {0};
+static bool g_should_save_wifi = false;
 
 constexpr EventBits_t WIFI_CONNECTED_BIT = BIT0;
 constexpr EventBits_t WIFI_GOT_IP_BIT = BIT1;
 static char g_prompt[16] = "cmd> ";
 
-static void init_console()
-{
+// ==========================================
+// 前置声明 (Forward Declarations)，解决编译报错
+// ==========================================
+static esp_err_t save_wifi_to_nvs(const char *ssid, const char *password);
+static esp_err_t load_saved_wifi();
+
+static void init_console() {
     fflush(stdout);
     fsync(fileno(stdout));
 
@@ -88,8 +107,7 @@ static void init_console()
     linenoiseHistorySetMaxLen(kConsoleHistoryLength);
 }
 
-static const char *current_prompt()
-{
+static const char *current_prompt() {
     switch (g_ctx.state) {
     case CONSOLE_STATE_COMMAND:
         std::snprintf(g_prompt, sizeof(g_prompt), "cmd> ");
@@ -107,24 +125,21 @@ static const char *current_prompt()
     return g_prompt;
 }
 
-static void print_prompt_hint()
-{
+static void print_prompt_hint() {
     if (g_ctx.state == CONSOLE_STATE_WAIT_WIFI_PASSWORD) {
         printf("Enter password for \"%s\".\n", g_ctx.selected_ssid);
     }
     fflush(stdout);
 }
 
-static void trim_line(char *line)
-{
+static void trim_line(char *line) {
     size_t len = std::strlen(line);
     while (len > 0 && (line[len - 1] == '\n' || line[len - 1] == '\r' || line[len - 1] == ' ' || line[len - 1] == '\t')) {
         line[--len] = '\0';
     }
 }
 
-static void init_nvs()
-{
+static void init_nvs() {
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -133,8 +148,7 @@ static void init_nvs()
     ESP_ERROR_CHECK(ret);
 }
 
-static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data)
-{
+static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
     (void)arg;
 
     if (event_base == WIFI_EVENT) {
@@ -158,11 +172,21 @@ static void wifi_event_handler(void *arg, esp_event_base_t event_base, int32_t e
         auto *event = static_cast<ip_event_got_ip_t *>(event_data);
         printf("Wi-Fi got IP: " IPSTR "\n", IP2STR(&event->ip_info.ip));
         xEventGroupSetBits(g_wifi_event_group, WIFI_GOT_IP_BIT);
+
+        if (g_should_save_wifi && g_connecting_ssid[0] != '\0') {
+            esp_err_t err = save_wifi_to_nvs(g_connecting_ssid, g_connecting_password);
+            if (err == ESP_OK) {
+                printf("Wi-Fi credentials saved to flash.\n");
+                load_saved_wifi();
+            }
+            g_should_save_wifi = false;
+            g_connecting_ssid[0] = '\0';
+            g_connecting_password[0] = '\0';
+        }
     }
 }
 
-static bool ensure_wifi_stack_ready()
-{
+static bool ensure_wifi_stack_ready() {
     if (g_wifi_stack_ready) {
         return true;
     }
@@ -232,24 +256,106 @@ static bool ensure_wifi_stack_ready()
 
         g_wifi_stack_ready = true;
         ESP_LOGI(TAG, "Wi-Fi stack initialized through ESP32-C5 hosted link");
+        load_saved_wifi();
     }
 
     return true;
 }
 
-static void print_help()
-{
+static void print_help() {
     printf("\nAvailable commands:\n");
     printf("  help      - show this help\n");
     printf("  wifiinit  - initialize hosted Wi-Fi stack\n");
     printf("  scan      - scan Wi-Fi and print the list\n");
     printf("  status    - print current Wi-Fi status\n");
     printf("  disconnect- disconnect current Wi-Fi\n");
+    printf("  stackinfo - show remaining stack space of console task\n");
+    printf("  autoconnect- auto-scan and connect to strongest saved Wi-Fi\n");
     printf("  reboot    - restart the chip\n");
 }
 
-static void print_status()
-{
+static void print_stack_info() {
+    UBaseType_t remaining_stack = uxTaskGetStackHighWaterMark(NULL);
+    printf("\nConsole task remaining stack: %u bytes\n", remaining_stack * sizeof(StackType_t));
+    printf("(Stack high water mark: %u words)\n", remaining_stack);
+}
+
+static esp_err_t save_wifi_to_nvs(const char *ssid, const char *password) {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READWRITE, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to open NVS namespace: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint32_t count = 0;
+    nvs_get_u32(handle, "count", &count);
+
+    bool found = false;
+    for (uint32_t i = 0; i < count && i < kMaxSavedWifi; i++) {
+        char key[32];
+        SavedWifiConfig saved;
+        std::snprintf(key, sizeof(key), "ssid_%lu", i);
+        if (nvs_get_str(handle, key, nullptr, nullptr) == ESP_OK) {
+            size_t len = sizeof(saved.ssid);
+            nvs_get_str(handle, key, saved.ssid, &len);
+            if (std::strcmp(saved.ssid, ssid) == 0) {
+                std::snprintf(key, sizeof(key), "pass_%lu", i);
+                len = sizeof(saved.password);
+                nvs_set_str(handle, key, password);
+                found = true;
+                break;
+            }
+        }
+    }
+
+    if (!found && count < kMaxSavedWifi) {
+        char key[32];
+        std::snprintf(key, sizeof(key), "ssid_%lu", count);
+        nvs_set_str(handle, key, ssid);
+        std::snprintf(key, sizeof(key), "pass_%lu", count);
+        nvs_set_str(handle, key, password);
+        count++;
+        nvs_set_u32(handle, "count", count);
+    }
+
+    nvs_commit(handle);
+    nvs_close(handle);
+    return ESP_OK;
+}
+
+static esp_err_t load_saved_wifi() {
+    nvs_handle_t handle;
+    esp_err_t err = nvs_open(kNvsNamespace, NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        if (err == ESP_ERR_NVS_NOT_FOUND) {
+            g_ctx.saved_wifi_count = 0;
+            return ESP_OK;
+        }
+        ESP_LOGE(TAG, "Failed to open NVS namespace: %s", esp_err_to_name(err));
+        return err;
+    }
+
+    uint32_t count = 0;
+    nvs_get_u32(handle, "count", &count);
+    g_ctx.saved_wifi_count = std::min((uint32_t)kMaxSavedWifi, count);
+
+    for (uint16_t i = 0; i < g_ctx.saved_wifi_count; i++) {
+        char key[32];
+        std::snprintf(key, sizeof(key), "ssid_%u", i);
+        size_t len = sizeof(g_ctx.saved_wifi[i].ssid);
+        nvs_get_str(handle, key, g_ctx.saved_wifi[i].ssid, &len);
+
+        std::snprintf(key, sizeof(key), "pass_%u", i);
+        len = sizeof(g_ctx.saved_wifi[i].password);
+        nvs_get_str(handle, key, g_ctx.saved_wifi[i].password, &len);
+    }
+
+    nvs_close(handle);
+    return ESP_OK;
+}
+
+static void print_status() {
     if (g_wifi_event_group == nullptr) {
         printf("\nWi-Fi event group not initialized yet.\n");
         printf("Run 'wifiinit' first.\n");
@@ -274,8 +380,7 @@ static void print_status()
     }
 }
 
-static void print_scan_results()
-{
+static void print_scan_results() {
     printf("\nFound %u AP(s):\n", g_ctx.scan_count);
     for (uint16_t i = 0; i < g_ctx.scan_count; ++i) {
         const wifi_ap_record_t &ap = g_ctx.scan_results[i];
@@ -288,12 +393,14 @@ static void print_scan_results()
     }
 }
 
-static void start_scan()
-{
+static void start_scan() {
     if (!ensure_wifi_stack_ready()) {
         printf("Wi-Fi init failed. Check C5 firmware/SDIO link and try again.\n");
         return;
     }
+
+    g_ctx.selected_index = -1;
+    g_ctx.selected_ssid[0] = '\0';
 
     uint16_t ap_count = kMaxScanResults;
     wifi_scan_config_t scan_cfg = {};
@@ -313,26 +420,19 @@ static void start_scan()
         g_ctx.state = CONSOLE_STATE_WAIT_WIFI_INDEX;
         printf("\nEnter the Wi-Fi index you want to connect.\n");
     } else {
-        printf("\nNo AP found.\n");
+        g_ctx.state = CONSOLE_STATE_COMMAND;
+        printf("\nNo AP found. Run 'scan' again when the network is available.\n");
     }
 }
 
-static void connect_selected_ap(const char *password)
-{
+static void connect_to_ap(const char *ssid, const char *password, bool save_to_nvs) {
     if (!ensure_wifi_stack_ready()) {
         printf("Wi-Fi init failed. Check C5 firmware/SDIO link and try again.\n");
         return;
     }
 
-    if (g_ctx.selected_index < 0 || g_ctx.selected_index >= g_ctx.scan_count) {
-        printf("No Wi-Fi selected.\n");
-        return;
-    }
-
     wifi_config_t wifi_config = {};
-    const wifi_ap_record_t &ap = g_ctx.scan_results[g_ctx.selected_index];
-
-    std::memcpy(wifi_config.sta.ssid, ap.ssid, sizeof(ap.ssid));
+    std::memcpy(wifi_config.sta.ssid, reinterpret_cast<const uint8_t *>(ssid), std::strlen(ssid));
     std::snprintf(reinterpret_cast<char *>(wifi_config.sta.password),
                   sizeof(wifi_config.sta.password),
                   "%s",
@@ -355,17 +455,83 @@ static void connect_selected_ap(const char *password)
         return;
     }
 
+    if (save_to_nvs) {
+        std::strncpy(g_connecting_ssid, ssid, sizeof(g_connecting_ssid) - 1);
+        g_connecting_ssid[sizeof(g_connecting_ssid) - 1] = '\0';
+        std::strncpy(g_connecting_password, password, sizeof(g_connecting_password) - 1);
+        g_connecting_password[sizeof(g_connecting_password) - 1] = '\0';
+        g_should_save_wifi = true;
+    }
+
     err = esp_wifi_connect();
     if (err != ESP_OK) {
         ESP_LOGE(TAG, "esp_wifi_connect failed: %s", esp_err_to_name(err));
+        g_should_save_wifi = false;
         return;
     }
 
-    printf("Connecting to \"%s\"...\n", g_ctx.selected_ssid);
+    printf("Connecting to \"%s\"...\n", ssid);
 }
 
-static void handle_command(char *line)
-{
+static void connect_selected_ap(const char *password) {
+    if (g_ctx.selected_index < 0 || g_ctx.selected_index >= g_ctx.scan_count) {
+        printf("No Wi-Fi selected.\n");
+        return;
+    }
+
+    const wifi_ap_record_t &ap = g_ctx.scan_results[g_ctx.selected_index];
+    connect_to_ap(reinterpret_cast<const char *>(ap.ssid), password, true);
+}
+
+static void autoconnect_wifi() {
+    if (!ensure_wifi_stack_ready()) {
+        printf("Wi-Fi init failed. Check C5 firmware/SDIO link and try again.\n");
+        return;
+    }
+
+    if (g_ctx.saved_wifi_count == 0) {
+        printf("No saved Wi-Fi networks found.\n");
+        return;
+    }
+
+    printf("Scanning for saved Wi-Fi networks...\n");
+    uint16_t ap_count = kMaxScanResults;
+    wifi_scan_config_t scan_cfg = {};
+
+    ESP_ERROR_CHECK(esp_wifi_scan_start(&scan_cfg, true));
+    ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, g_ctx.scan_results));
+
+    int best_index = -1;
+    int8_t best_rssi = -127;
+
+    for (uint16_t i = 0; i < ap_count; i++) {
+        const char *scan_ssid = reinterpret_cast<const char *>(g_ctx.scan_results[i].ssid);
+        for (uint16_t j = 0; j < g_ctx.saved_wifi_count; j++) {
+            if (std::strcmp(scan_ssid, g_ctx.saved_wifi[j].ssid) == 0) {
+                if (g_ctx.scan_results[i].rssi > best_rssi) {
+                    best_rssi = g_ctx.scan_results[i].rssi;
+                    best_index = i;
+                }
+                break;
+            }
+        }
+    }
+
+    if (best_index >= 0) {
+        const char *best_ssid = reinterpret_cast<const char *>(g_ctx.scan_results[best_index].ssid);
+        for (uint16_t i = 0; i < g_ctx.saved_wifi_count; i++) {
+            if (std::strcmp(best_ssid, g_ctx.saved_wifi[i].ssid) == 0) {
+                printf("Found best saved network: %s (RSSI: %d dBm)\n", best_ssid, best_rssi);
+                connect_to_ap(best_ssid, g_ctx.saved_wifi[i].password, false);
+                return;
+            }
+        }
+    }
+
+    printf("No saved Wi-Fi networks detected in scan results.\n");
+}
+
+static void handle_command(char *line) {
     if (std::strcmp(line, "help") == 0) {
         print_help();
     } else if (std::strcmp(line, "wifiinit") == 0) {
@@ -378,6 +544,10 @@ static void handle_command(char *line)
         start_scan();
     } else if (std::strcmp(line, "status") == 0) {
         print_status();
+    } else if (std::strcmp(line, "stackinfo") == 0) {
+        print_stack_info();
+    } else if (std::strcmp(line, "autoconnect") == 0) {
+        autoconnect_wifi();
     } else if (std::strcmp(line, "disconnect") == 0) {
         if (!ensure_wifi_stack_ready()) {
             printf("Wi-Fi init failed. Check C5 firmware/SDIO link.\n");
@@ -400,13 +570,17 @@ static void handle_command(char *line)
     }
 }
 
-static void handle_wifi_index(char *line)
-{
+static void handle_wifi_index(char *line) {
+    if (std::strcmp(line, "scan") == 0 || std::strcmp(line, "rescan") == 0) {
+        start_scan();
+        return;
+    }
+
     char *end = nullptr;
     long index = std::strtol(line, &end, 10);
 
     if (end == line || *end != '\0' || index < 0 || index >= g_ctx.scan_count) {
-        printf("Invalid index. Enter a number from 0 to %u.\n", g_ctx.scan_count - 1);
+        printf("Invalid index. Enter a number from 0 to %u, or type 'scan' to scan again.\n", g_ctx.scan_count > 0 ? g_ctx.scan_count - 1 : 0);
         return;
     }
 
@@ -421,14 +595,12 @@ static void handle_wifi_index(char *line)
     printf("Selected SSID: %s\n", g_ctx.selected_ssid);
 }
 
-static void handle_wifi_password(char *line)
-{
+static void handle_wifi_password(char *line) {
     connect_selected_ap(line);
     g_ctx.state = CONSOLE_STATE_COMMAND;
 }
 
-static void console_task(void *arg)
-{
+static void console_task(void *arg) {
     (void)arg;
 
     printf("\nESP32-P4 data-processing console ready.\n");
@@ -475,8 +647,7 @@ static void console_task(void *arg)
 
 }  // namespace
 
-extern "C" void app_main()
-{
+extern "C" void app_main() {
     init_nvs();
     init_console();
 
