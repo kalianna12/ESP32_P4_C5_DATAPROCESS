@@ -315,11 +315,44 @@ bool wifi_ensure_stack_ready() {
         ESP_LOGE(TAG, "esp_wifi_start failed: %s", esp_err_to_name(err));
         return false;
     }
+    // ==============================================================
+    // [修复开始] 等待 C5 协处理器底层的 Wi-Fi 状态机真正就绪
+    // ==============================================================
+    ESP_LOGI(TAG, "Waiting for Coprocessor (C5) Wi-Fi station to start...");
+    
+    int wait_ms = 0;
+    // 循环等待，直到 event_handler 将 wifi_started 设为 true，最多等 3 秒
+    while (!g_ctx.wifi_started && wait_ms < 3000) {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        wait_ms += 50;
+    }
+
+    if (!g_ctx.wifi_started) {
+        ESP_LOGE(TAG, "C5 Wi-Fi failed to start in time. Please check SDIO link or reboot.");
+        return false;
+    }
+
+    // 【极其关键的延时】
+    // 即便收到了 start 事件，C5 的底层网络队列仍需时间初始化完毕。
+    // 多给 200ms 的喘息时间，防止紧接着的 Scan 或 Connect 指令导致 C5 堵死丢包
+    vTaskDelay(pdMS_TO_TICKS(200));
+    // ==============================================================
+    // [修复结束]
+    // ==============================================================
 
     g_wifi_stack_ready = true;
     ESP_LOGI(TAG, "Wi-Fi stack initialized through ESP32-C5 hosted link");
     load_saved_wifi();
     return true;
+}
+
+bool wifi_is_connected_with_ip() {
+    if (g_wifi_event_group == nullptr) {
+        return false;
+    }
+
+    const EventBits_t bits = xEventGroupGetBits(g_wifi_event_group);
+    return (bits & WIFI_CONNECTED_BIT) && (bits & WIFI_GOT_IP_BIT);
 }
 
 void wifi_start_scan() {
@@ -330,7 +363,6 @@ void wifi_start_scan() {
 
     g_ctx.selected_index = -1;
     g_ctx.selected_ssid[0] = '\0';
-
     uint16_t ap_count = kMaxScanResults;
     wifi_scan_config_t scan_cfg = {};
 

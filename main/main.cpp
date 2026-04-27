@@ -3,6 +3,7 @@
 #include "freertos/task.h"
 
 #include "console_task.h"
+#include "dataprocess.h"
 #include "wifi.h"
 
 namespace {
@@ -18,6 +19,7 @@ extern "C" void app_main() {
     ESP_LOGI(TAG, "Use the serial console to initialize Wi-Fi, scan, and connect");
 
     console_task_start();
+    data_process_start();
 
     while (true) {
         vTaskDelay(portMAX_DELAY);

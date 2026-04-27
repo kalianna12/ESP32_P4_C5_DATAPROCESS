@@ -5,6 +5,7 @@
 
 void wifi_init_storage();
 bool wifi_ensure_stack_ready();
+bool wifi_is_connected_with_ip();
 void wifi_start_scan();
 void wifi_print_status();
 void wifi_autoconnect();

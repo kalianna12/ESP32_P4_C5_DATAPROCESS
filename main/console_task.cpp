@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "linenoise/linenoise.h"
 
+#include "dataprocess.h"
 #include "wifi.h"
 
 namespace {
@@ -106,20 +107,203 @@ static void trim_line(char *line) {
 
 static void print_help() {
     printf("\nAvailable commands:\n");
-    printf("  help       - show this help\n");
-    printf("  wifiinit   - initialize hosted Wi-Fi stack\n");
-    printf("  scan       - scan Wi-Fi and print the list\n");
-    printf("  status     - print current Wi-Fi status\n");
-    printf("  disconnect - disconnect current Wi-Fi\n");
-    printf("  stackinfo  - show remaining stack space of console task\n");
-    printf("  autoconnect- auto-scan and connect to strongest saved Wi-Fi\n");
-    printf("  reboot     - restart the chip\n");
+    // 使用 %-32s 让左边的命令固定占用 32 个字符宽度，不足补空格
+    printf("  %-32s - %s\n", "help", "show this help");
+    printf("  %-32s - %s\n", "wifiinit", "initialize hosted Wi-Fi stack");
+    printf("  %-32s - %s\n", "scan", "scan Wi-Fi and print the list");
+    printf("  %-32s - %s\n", "status", "print current Wi-Fi status");
+    printf("  %-32s - %s\n", "disconnect", "disconnect current Wi-Fi");
+    printf("  %-32s - %s\n", "stackinfo", "show remaining stack space of console task");
+    printf("  %-32s - %s\n", "autoconnect", "auto-scan and connect to strongest saved Wi-Fi");
+    printf("  %-32s - %s\n", "dpstatus", "show TCP/CCA runtime status");
+    printf("  %-32s - %s\n", "dpcfg", "show current data-processing config");
+    printf("  %-32s - %s\n", "dpreset", "clear current runtime counters/window");
+    printf("  %-32s - %s\n", "dpsamplerate <hz>", "update CCA sample rate");
+    printf("  %-32s - %s\n", "dpchannels <all|1,2,3,4>", "enable the selected channels");
+    printf("  %-32s - %s\n", "dpfilter <on|off>", "enable or disable all software filtering");
+    printf("  %-32s - %s\n", "dphp <on|off> [cutoff_hz]", "control the high-pass stage");
+    printf("  %-32s - %s\n", "dpnotch <on|off> [freq_hz] [q]", "control the notch stage");
+    printf("  %-32s - %s\n", "reboot", "restart the chip");
 }
 
 static void print_stack_info() {
     UBaseType_t remaining_stack = uxTaskGetStackHighWaterMark(nullptr);
     printf("\nConsole task remaining stack: %u bytes\n", remaining_stack * sizeof(StackType_t));
     printf("(Stack high water mark: %u words)\n", remaining_stack);
+}
+
+static bool parse_on_off(const char *value, bool *enabled) {
+    if (value == nullptr || enabled == nullptr) {
+        return false;
+    }
+    if (std::strcmp(value, "on") == 0) {
+        *enabled = true;
+        return true;
+    }
+    if (std::strcmp(value, "off") == 0) {
+        *enabled = false;
+        return true;
+    }
+    return false;
+}
+
+static const char *stream_format_name(DataStreamFormat format) {
+    switch (format) {
+    case DataStreamFormat::BinaryAds1299:
+        return "binary_ads1299";
+    case DataStreamFormat::TextDelimited:
+        return "text_csv";
+    case DataStreamFormat::Unknown:
+    default:
+        return "unknown";
+    }
+}
+
+static void print_data_process_status() {
+    DataProcessStatus status = {};
+    if (!data_process_get_status(&status)) {
+        printf("Failed to read data-process status.\n");
+        return;
+    }
+
+    printf("\n%-25s : %s\n", "Data process task started", status.task_started ? "yes" : "no");
+    printf("%-25s : %s\n", "TCP listening", status.tcp_listening ? "yes" : "no");
+    printf("%-25s : %s\n", "Client connected", status.client_connected ? "yes" : "no");
+    if (status.client_connected || status.client_ip[0] != '\0') {
+        printf("%-25s : %s:%u\n", "Client endpoint", status.client_ip[0] != '\0' ? status.client_ip : "-", status.client_port);
+    }
+    printf("%-25s : %s\n", "Detected stream format", stream_format_name(status.stream_format));
+    printf("%-25s : %lu\n", "Samples received", static_cast<unsigned long>(status.samples_received));
+    printf("%-25s : %lu ms\n", "Last RX timestamp", static_cast<unsigned long>(status.last_rx_timestamp_ms));
+    printf("%-25s : %lu\n", "Detections sent", static_cast<unsigned long>(status.detection_count));
+    printf("%-25s : %lu\n", "CRC errors", static_cast<unsigned long>(status.crc_error_count));
+    printf("%-25s : %lu\n", "Text parse errors", static_cast<unsigned long>(status.text_parse_error_count));
+    
+    printf("%-25s : ", "Last binary seq");
+    if (status.has_binary_seq) {
+        printf("%u\n", status.last_binary_seq);
+    } else {
+        printf("n/a\n");
+    }
+
+    if (status.last_detection.valid) {
+        printf("%-25s : %u Hz idx=%u conf=%.3f @ sample %lu\n", "Last detection",
+               status.last_detection.detected_hz,
+               status.last_detection.detected_index,
+               status.last_detection.confidence,
+               static_cast<unsigned long>(status.last_detection.sample_counter));
+        printf("%-25s : [%.3f %.3f %.3f %.3f]\n", "Correlations",
+               status.last_detection.correlations[0],
+               status.last_detection.correlations[1],
+               status.last_detection.correlations[2],
+               status.last_detection.correlations[3]);
+    } else {
+        printf("%-25s : none yet\n", "Last detection");
+    }
+}
+
+static void print_data_process_config() {
+    DataProcessConfigSnapshot config = {};
+    if (!data_process_get_config(&config)) {
+        printf("Failed to read data-process config.\n");
+        return;
+    }
+
+    printf("\n%-22s : %d Hz\n", "Sample rate", config.sample_rate_hz);
+    printf("%-22s : %u, %u, %u, %u Hz\n", "Target freqs",
+           config.target_freq_hz[0], config.target_freq_hz[1],
+           config.target_freq_hz[2], config.target_freq_hz[3]);
+    
+    printf("%-22s :", "Channels enabled");
+    for (size_t i = 0; i < config.channel_enabled.size(); ++i) {
+        if (config.channel_enabled[i]) {
+            printf(" %u", static_cast<unsigned>(i + 1));
+        }
+    }
+    printf("\n");
+    
+    printf("%-22s : %s\n", "Filter enabled", config.filter_enabled ? "on" : "off");
+    printf("%-22s : %s (cutoff %.2f Hz)\n", "High-pass", config.high_pass_enabled ? "on" : "off", config.high_pass_cutoff_hz);
+    printf("%-22s : %s (freq %.2f Hz, Q %.2f)\n", "Notch", config.notch_enabled ? "on" : "off", config.notch_hz, config.notch_q);
+}
+
+static void handle_data_process_command(char *line) {
+    if (std::strcmp(line, "dpstatus") == 0) {
+        print_data_process_status();
+        return;
+    }
+    if (std::strcmp(line, "dpcfg") == 0) {
+        print_data_process_config();
+        return;
+    }
+    if (std::strcmp(line, "dpreset") == 0) {
+        data_process_reset_runtime();
+        printf("Data-process runtime state cleared.\n");
+        return;
+    }
+    if (std::strncmp(line, "dpsamplerate ", 13) == 0) {
+        char *end = nullptr;
+        const long sample_rate = std::strtol(line + 13, &end, 10);
+        if (end == line + 13 || *end != '\0' || !data_process_set_sample_rate(static_cast<int>(sample_rate))) {
+            printf("Usage: dpsamplerate <64..4000>\n");
+            return;
+        }
+        printf("Sample rate updated to %ld Hz.\n", sample_rate);
+        return;
+    }
+    if (std::strncmp(line, "dpchannels ", 11) == 0) {
+        if (!data_process_set_channels_from_list(line + 11)) {
+            printf("Usage: dpchannels <all|1,2,3,4>\n");
+            return;
+        }
+        printf("Channel selection updated.\n");
+        return;
+    }
+    if (std::strncmp(line, "dpfilter ", 9) == 0) {
+        bool enabled = false;
+        if (!parse_on_off(line + 9, &enabled) || !data_process_set_filter_enabled(enabled)) {
+            printf("Usage: dpfilter <on|off>\n");
+            return;
+        }
+        printf("Software filter %s.\n", enabled ? "enabled" : "disabled");
+        return;
+    }
+    if (std::strncmp(line, "dphp ", 5) == 0) {
+        char mode[8] = {0};
+        float cutoff_hz = 1.0f;
+        const int parsed = std::sscanf(line + 5, "%7s %f", mode, &cutoff_hz);
+        bool enabled = false;
+        if (parsed < 1 || !parse_on_off(mode, &enabled)) {
+            printf("Usage: dphp <on|off> [cutoff_hz]\n");
+            return;
+        }
+        if (!data_process_set_high_pass(enabled, cutoff_hz)) {
+            printf("High-pass update failed. Check cutoff against current sample rate.\n");
+            return;
+        }
+        printf("High-pass %s at %.2f Hz.\n", enabled ? "enabled" : "disabled", cutoff_hz);
+        return;
+    }
+    if (std::strncmp(line, "dpnotch ", 8) == 0) {
+        char mode[8] = {0};
+        float notch_hz = 50.0f;
+        float q = 30.0f;
+        const int parsed = std::sscanf(line + 8, "%7s %f %f", mode, &notch_hz, &q);
+        bool enabled = false;
+        if (parsed < 1 || !parse_on_off(mode, &enabled)) {
+            printf("Usage: dpnotch <on|off> [freq_hz] [q]\n");
+            return;
+        }
+        if (!data_process_set_notch(enabled, notch_hz, q)) {
+            printf("Notch update failed. Check freq/Q against current sample rate.\n");
+            return;
+        }
+        printf("Notch %s at %.2f Hz, Q=%.2f.\n", enabled ? "enabled" : "disabled", notch_hz, q);
+        return;
+    }
+
+    printf("Unknown data-process command: %s\n", line);
+    printf("Run 'help' to see the available dp* commands.\n");
 }
 
 static void handle_command(char *line) {
@@ -148,6 +332,8 @@ static void handle_command(char *line) {
         printf("Rebooting...\n");
         fflush(stdout);
         esp_restart();
+    } else if (std::strncmp(line, "dp", 2) == 0) {
+        handle_data_process_command(line);
     } else if (line[0] != '\0') {
         printf("Unknown command: %s\n", line);
         print_help();
