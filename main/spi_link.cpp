@@ -5,38 +5,49 @@
 #include "driver/gpio.h"
 #include "driver/spi_master.h"
 #include "esp_log.h"
+#include "spi_protocol.h"
 
 namespace {
 
 constexpr char kTag[] = "spi_link";
 
-// Adjust these GPIOs to match the real P4-to-P4 wiring.
+// Host P4 (WTDKP4C5-S1 J2) <-> Display P4X-Function-EV-Board (J1)
+// MOSI: GPIO21 <-> GPIO21
+// MISO: GPIO22 <-> GPIO22
+// SCLK: GPIO23 <-> GPIO23
+// CS  : GPIO3  <-> GPIO3
+// GND : must be connected on both boards
 constexpr spi_host_device_t kSpiHost = SPI2_HOST;
-constexpr gpio_num_t kSpiMosi = GPIO_NUM_11;
-constexpr gpio_num_t kSpiMiso = GPIO_NUM_NC;
-constexpr gpio_num_t kSpiSclk = GPIO_NUM_12;
-constexpr gpio_num_t kSpiCs = GPIO_NUM_10;
+constexpr gpio_num_t kSpiMosi = GPIO_NUM_21;
+constexpr gpio_num_t kSpiMiso = GPIO_NUM_22;
+constexpr gpio_num_t kSpiSclk = GPIO_NUM_23;
+constexpr gpio_num_t kSpiCs = GPIO_NUM_3;
 constexpr int kSpiClockHz = 1 * 1000 * 1000;
 
-constexpr uint16_t kPacketMagic = 0x5353;
-constexpr uint8_t kPacketVersion = 1;
-
-struct __attribute__((packed)) SpiResultPacket {
-    uint16_t magic;
-    uint8_t version;
-    uint8_t flags;
-    uint8_t detected_index;
-    uint8_t reserved0;
-    uint16_t detected_hz;
-    uint16_t binary_seq;
-    uint16_t reserved1;
-    uint32_t sample_counter;
-    uint32_t timestamp_ms;
-    float confidence;
-    float correlations[4];
-};
-
 spi_device_handle_t g_spi = nullptr;
+
+bool frequency_to_index(uint16_t detected_hz, uint8_t *detected_index) {
+    if (detected_index == nullptr) {
+        return false;
+    }
+
+    switch (detected_hz) {
+    case 8:
+        *detected_index = 0;
+        return true;
+    case 10:
+        *detected_index = 1;
+        return true;
+    case 12:
+        *detected_index = 2;
+        return true;
+    case 14:
+        *detected_index = 3;
+        return true;
+    default:
+        return false;
+    }
+}
 
 }  // namespace
 
@@ -81,8 +92,6 @@ bool spi_link_send_result(const DetectionResult &result) {
     }
 
     SpiResultPacket packet = {};
-    packet.magic = kPacketMagic;
-    packet.version = kPacketVersion;
     packet.flags = result.valid ? 0x01 : 0x00;
     packet.detected_index = result.detected_index;
     packet.detected_hz = result.detected_hz;
@@ -103,4 +112,26 @@ bool spi_link_send_result(const DetectionResult &result) {
     }
 
     return true;
+}
+
+bool spi_link_send_test_frequency(uint16_t detected_hz) {
+    uint8_t detected_index = 0xFF;
+    if (!frequency_to_index(detected_hz, &detected_index)) {
+        ESP_LOGW(kTag, "Unsupported test frequency: %u Hz", detected_hz);
+        return false;
+    }
+
+    DetectionResult result = {};
+    result.valid = true;
+    result.detected_index = detected_index;
+    result.detected_hz = detected_hz;
+    result.confidence = 1.0f;
+    result.timestamp_ms = 0;
+    result.correlations[detected_index] = 1.0f;
+
+    const bool ok = spi_link_send_result(result);
+    if (ok) {
+        ESP_LOGI(kTag, "Sent SPI test packet: %u Hz idx=%u", detected_hz, detected_index);
+    }
+    return ok;
 }

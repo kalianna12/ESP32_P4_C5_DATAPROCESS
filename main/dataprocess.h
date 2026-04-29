@@ -3,7 +3,7 @@
 #include <array>
 #include <cstdint>
 
-struct DetectionResult {
+    struct DetectionResult {
     bool valid = false;
     uint8_t detected_index = 0xFF;
     uint16_t detected_hz = 0;

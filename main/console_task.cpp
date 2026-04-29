@@ -14,6 +14,7 @@
 #include "linenoise/linenoise.h"
 
 #include "dataprocess.h"
+#include "spi_link.h"
 #include "wifi.h"
 
 namespace {
@@ -123,6 +124,7 @@ static void print_help() {
     printf("  %-32s - %s\n", "dpfilter <on|off>", "enable or disable all software filtering");
     printf("  %-32s - %s\n", "dphp <on|off> [cutoff_hz]", "control the high-pass stage");
     printf("  %-32s - %s\n", "dpnotch <on|off> [freq_hz] [q]", "control the notch stage");
+    printf("  %-32s - %s\n", "8 | 10 | 12 | 14", "send a SPI test result to the display P4");
     printf("  %-32s - %s\n", "reboot", "restart the chip");
 }
 
@@ -309,6 +311,16 @@ static void handle_data_process_command(char *line) {
 static void handle_command(char *line) {
     if (std::strcmp(line, "help") == 0) {
         print_help();
+    } else if (std::strcmp(line, "8") == 0 ||
+               std::strcmp(line, "10") == 0 ||
+               std::strcmp(line, "12") == 0 ||
+               std::strcmp(line, "14") == 0) {
+        const uint16_t detected_hz = static_cast<uint16_t>(std::strtoul(line, nullptr, 10));
+        if (spi_link_send_test_frequency(detected_hz)) {
+            printf("SPI test packet sent: %u Hz\n", detected_hz);
+        } else {
+            printf("Failed to send SPI test packet: %u Hz\n", detected_hz);
+        }
     } else if (std::strcmp(line, "wifiinit") == 0) {
         if (wifi_ensure_stack_ready()) {
             printf("Wi-Fi stack initialized.\n");
