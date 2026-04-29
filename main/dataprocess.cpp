@@ -150,6 +150,16 @@ private:
     std::array<HighPassState, kChannels> high_pass_{};
     std::array<BiquadState, kChannels> notch_{};
     ConnectionState connection_;
+     // ================= 新增：3秒注视与防抖变量 =================
+    uint8_t consecutive_target_ = 0xFF; // 当前正在累积的注视目标
+    int consecutive_count_ = 0;         // 有效注视累积次数
+    int miss_count_ = 0;                // 中途走神/误判次数
+    
+    // 12次 * 0.248秒 ≈ 3.0秒（需要看多久）
+    static constexpr int kRequiredConsecutiveHits = 12; 
+    // 允许偶尔误判的次数。3次 ≈ 0.75秒（中途眨眼、干扰不算断开）
+    static constexpr int kMaxMissesAllowed = 3;         
+    // =========================================================
     uint32_t samples_received_ = 0;
     uint32_t last_detection_sample_ = 0;
     uint16_t last_binary_seq_ = 0;
@@ -410,6 +420,10 @@ void DataProcessor::reset_runtime_state() {
     last_detection_result_ = {};
     client_ip_[0] = '\0';
     client_port_ = 0;
+    // 新增清零
+    consecutive_target_ = 0xFF;
+    consecutive_count_ = 0;
+    miss_count_ = 0;
     init_filter_states();
 }
 
@@ -890,21 +904,73 @@ DetectionResult DataProcessor::compute_cca() {
         }
     }
 
-    if (best_index != 0xFF && best_corr >= kDetectionThreshold) {
-        result.valid = true;
-        result.detected_index = best_index;
-        result.detected_hz = local_target_freq_hz[best_index];
-        result.confidence = best_corr;
-        ESP_LOGI(kTag,
-                 "CCA detected %u Hz idx=%u conf=%.3f [%.3f %.3f %.3f %.3f]",
-                 result.detected_hz,
-                 result.detected_index,
-                 result.confidence,
-                 result.correlations[0],
-                 result.correlations[1],
-                 result.correlations[2],
-                 result.correlations[3]);
+    // ================== 全新的 3秒注视防抖判定逻辑 ==================
+    result.valid = false; // 默认这帧数据不触发输出
+
+    // 这一帧是否算作有效识别到了某个具体频率
+    bool is_hit = (best_index != 0xFF) && (best_corr >= kDetectionThreshold);
+
+    if (is_hit) {
+        if (best_index == consecutive_target_) {
+            // 1. 命中正在注视的目标：有效次数+1，走神次数清零！
+            consecutive_count_++;
+            miss_count_ = 0; 
+        } else {
+            // 2. 算出了别的频率
+            if (consecutive_target_ == 0xFF) {
+                // 刚开始注视一个新目标
+                consecutive_target_ = best_index;
+                consecutive_count_ = 1;
+                miss_count_ = 0;
+            } else {
+                // 正在注视A，却突然算出B，算作一次误判
+                miss_count_++;
+                if (miss_count_ > kMaxMissesAllowed) {
+                    // 误判/走神太久，转移目标到 B
+                    consecutive_target_ = best_index;
+                    consecutive_count_ = 1;
+                    miss_count_ = 0;
+                }
+            }
+        }
+    } else {
+        // 3. 没超过阈值（可能是走神了，或者闭眼了）
+        if (consecutive_target_ != 0xFF) {
+            miss_count_++;
+            if (miss_count_ > kMaxMissesAllowed) {
+                // 走神太久，注视进度彻底清零
+                consecutive_target_ = 0xFF;
+                consecutive_count_ = 0;
+                miss_count_ = 0;
+            }
+        }
     }
+
+    // 【实现回显】：无论是否达标，每隔 0.25 秒都在串口打印，方便观察混频下 CCA 的表现
+    ESP_LOGI(kTag, "CCA Echo: [%.3f %.3f %.3f %.3f] Max=%.3f(Idx=%u) | Track: Idx=%u, Hit=%d/%d, Miss=%d/%d",
+             result.correlations[0], result.correlations[1],
+             result.correlations[2], result.correlations[3],
+             best_corr, best_index != 0xFF ? best_index : 99,
+             consecutive_target_ != 0xFF ? consecutive_target_ : 99,
+             consecutive_count_, kRequiredConsecutiveHits,
+             miss_count_, kMaxMissesAllowed);
+
+    // 【触发判定】：如果累计达到要求（3秒）
+    if (consecutive_count_ >= kRequiredConsecutiveHits) {
+        result.valid = true;
+        result.detected_index = consecutive_target_;
+        result.detected_hz = local_target_freq_hz[consecutive_target_];
+        result.confidence = best_corr; // 用最新这帧的相关系数
+
+        // 高亮警告，提示成功触发！
+        ESP_LOGW(kTag, ">>> STARE CONFIRMED: %u Hz (held for 3 seconds) <<<", result.detected_hz);
+
+        // 触发一次后，进度彻底清零，想要再次触发必须重新盯 3 秒（防止疯狂连发指令）
+        consecutive_target_ = 0xFF;
+        consecutive_count_ = 0;
+        miss_count_ = 0;
+    }
+
 
     return result;
 }
